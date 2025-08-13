@@ -1,83 +1,95 @@
-﻿using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Net.Security;
-using System.Security.Authentication;
+﻿using System.Net.Http.Headers;
 using System.Text;
-using System.Text.Json;
 
 namespace FrogProg.KafkaProxyClient;
 
-public sealed class SseProxyClient : IDisposable
+public sealed class SseChatClient : IAsyncDisposable
 {
-    private readonly ProxyConfig _cfg;
     private readonly HttpClient _http;
+    private readonly Uri _baseStreamUri;
 
-    public SseProxyClient(ProxyConfig cfg, bool skipTlsVerify = false)
+    public SseChatClient(string baseStreamUrl, bool allowInsecureHttp = true, bool skipTlsVerify = false)
     {
-        _cfg = cfg;
-        var handler = new HttpClientHandler
+        var handler = new HttpClientHandler();
+        if (skipTlsVerify)
         {
-            SslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-            ServerCertificateCustomValidationCallback = skipTlsVerify
-                ? HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
-                : null
+            handler.ServerCertificateCustomValidationCallback =
+                HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+        }
+        if (!allowInsecureHttp && baseStreamUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("HTTPS required");
+
+        _http = new HttpClient(handler, disposeHandler: true)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
         };
-        _http = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+        _http.DefaultRequestHeaders.Accept.Clear();
+        _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
+        _http.DefaultRequestHeaders.CacheControl = new CacheControlHeaderValue { NoCache = true };
+
+        _baseStreamUri = new Uri(baseStreamUrl, UriKind.Absolute);
     }
 
-    public async Task SubscribeAsync(string bearerToken, Func<JsonElement, Task> onMessage, CancellationToken ct)
+    public async Task SubscribeChatAsync(string bearerToken, string chatId, string from = "latest",
+        Func<string, Task>? onEvent = null, CancellationToken ct = default)
     {
-        var url = new UriBuilder(_cfg.SseUrl);
-        url.Query = $"topics={Uri.EscapeDataString(string.Join(",", _cfg.Topics))}&from=latest";
+        if (string.IsNullOrWhiteSpace(chatId)) throw new ArgumentNullException(nameof(chatId));
+        _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
 
-        using var req = new HttpRequestMessage(HttpMethod.Get, url.Uri);
-        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
-        req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
-        req.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
+        var uriBuilder = new UriBuilder(_baseStreamUri);
+        var chatQ = $"chatId={Uri.EscapeDataString(chatId)}";
+        var fromQ = string.IsNullOrWhiteSpace(from) ? "" : $"&from={Uri.EscapeDataString(from)}";
+        if (string.IsNullOrEmpty(uriBuilder.Query))
+            uriBuilder.Query = chatQ + fromQ;
+        else
+            uriBuilder.Query = uriBuilder.Query.TrimStart('?') + "&" + chatQ + fromQ;
 
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        using var req = new HttpRequestMessage(HttpMethod.Get, uriBuilder.Uri);
+        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        resp.EnsureSuccessStatusCode();
 
-        if (!resp.IsSuccessStatusCode)
-        {
-            var body = await resp.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException($"SSE subscribe failed {resp.StatusCode}: {body}");
-        }
+        await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 8192, leaveOpen: true);
 
-        using var stream = await resp.Content.ReadAsStreamAsync(ct);
-        using var reader = new StreamReader(stream, Encoding.UTF8);
-
+        string? line;
         var sb = new StringBuilder();
+        string? evtName = null;
+
         while (!reader.EndOfStream && !ct.IsCancellationRequested)
         {
-            var line = await reader.ReadLineAsync() ?? string.Empty;
+            line = await reader.ReadLineAsync().ConfigureAwait(false);
+            if (line is null) break;
 
-            if (string.IsNullOrEmpty(line))
+            if (line.Length == 0)
             {
-                var block = sb.ToString();
+                var data = sb.ToString();
                 sb.Clear();
-
-                var dataLine = block.Split('\n').FirstOrDefault(l => l.StartsWith("data: "));
-                if (dataLine is not null)
+                if (!string.IsNullOrEmpty(data))
                 {
-                    var json = dataLine.AsSpan(6).ToString();
-                    try
-                    {
-                        using var doc = JsonDocument.Parse(json);
-                        await onMessage(doc.RootElement.Clone());
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"! SSE parse error: {ex.Message}");
-                    }
+                    if (onEvent is not null) await onEvent.Invoke(data).ConfigureAwait(false);
+                    else Console.WriteLine($"← [{evtName ?? "message"}] {data}");
                 }
+                evtName = null;
                 continue;
             }
 
-            // keep-alive / comments начинаются с ':'
-            if (!line.StartsWith(":"))
-                sb.AppendLine(line);
+            if (line.StartsWith("event:", StringComparison.Ordinal))
+            {
+                evtName = line.Substring("event:".Length).Trim();
+                continue;
+            }
+
+            if (line.StartsWith("data:", StringComparison.Ordinal))
+            {
+                if (sb.Length > 0) sb.Append('\n');
+                sb.Append(line.Substring("data:".Length).TrimStart());
+            }
         }
     }
 
-    public void Dispose() => _http.Dispose();
+    public ValueTask DisposeAsync()
+    {
+        _http.Dispose();
+        return ValueTask.CompletedTask;
+    }
 }

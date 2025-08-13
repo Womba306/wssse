@@ -6,14 +6,13 @@ public static class Program
 {
     public static async Task<int> Main(string[] args)
     {
-        // --mode ws|sse   (default ws)
-        // --once          (send one produce and exit)
         var mode = args.SkipWhile(a => a != "--mode").Skip(1).FirstOrDefault() ?? "ws";
         var once = args.Contains("--once");
+        var chatArg = args.SkipWhile(a => a != "--chat").Skip(1).FirstOrDefault();
 
         var cfg = LoadConfig();
         Console.WriteLine($"Mode={mode} Once={once}");
-        Console.WriteLine($"Auth={cfg.Auth.Authority}  WS={cfg.Proxy.WsUrl}  SSE={cfg.Proxy.SseUrl}");
+        Console.WriteLine($"Auth={cfg.Auth.Authority}  WS={cfg.Proxy.WsUrl}  SSE={cfg.Proxy.SseUrl}  SSE_CHAT={cfg.Proxy.StreamChatUrl}");
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -32,44 +31,61 @@ public static class Program
             }
             else Console.WriteLine("↪ Использую ACCESS_TOKEN из окружения");
 
-            if (mode.Equals("sse", StringComparison.OrdinalIgnoreCase))
+            if (mode.Equals("sse-chat", StringComparison.OrdinalIgnoreCase))
             {
-                using var sse = new SseProxyClient(cfg.Proxy, cfg.Auth.SkipTlsVerify);
-                Console.WriteLine($"→ SSE подписка на [{string.Join(",", cfg.Proxy.Topics)}]");
-                await sse.SubscribeAsync(token!, OnMessage, cts.Token);
+                var chatId = chatArg ?? Environment.GetEnvironmentVariable("CHAT_ID") ?? cfg.Proxy.ChatId;
+                if (string.IsNullOrWhiteSpace(chatId))
+                {
+                    Console.Error.WriteLine("Нужен chatId: --chat <id> или ENV CHAT_ID или Proxy.ChatId в appsettings.json");
+                    return 2;
+                }
+
+                await using var sse = new SseChatClient(cfg.Proxy.StreamChatUrl ?? "http://91.206.15.217:8083/stream_chat",
+                                                        allowInsecureHttp: true,
+                                                        skipTlsVerify: cfg.Auth.SkipTlsVerify);
+                Console.WriteLine($"→ SSE подписка на чат {chatId}");
+                await sse.SubscribeChatAsync(token!, chatId!, from: "latest",
+                    onEvent: async data =>
+                    {
+                        Console.WriteLine($"← {DateTimeOffset.Now:HH:mm:ss} {data}");
+                        await Task.CompletedTask;
+                    }, ct: cts.Token);
                 return 0;
             }
 
+            if (mode.Equals("sse", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"→ SSE подписка на [{string.Join(",", cfg.Proxy.Topics)}]");
+                Console.WriteLine("! Режим sse не реализован в этом минимальном клиенте. Используй sse-chat.");
+                return 0;
+            }
+
+            // ws
             await using var ws = new WsProxyClient(cfg.Proxy);
             Console.WriteLine("→ WS подключение...");
             await ws.ConnectAsync(token!, cts.Token);
-            await ws.SubscribeAsync(cfg.Proxy.Topics, "latest", cts.Token);
 
-            // тестовая отправка
-            var sample = new { hello = "world", ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
-            await ws.ProduceAsync(sample, key: cfg.Proxy.ProduceKey, headers: cfg.Proxy.ProduceHeaders, ct: cts.Token);
-            Console.WriteLine($"✓ Отправлено в {cfg.Proxy.ProduceTopic}");
-
-            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-            var readTask = ws.ReceiveLoopAsync(OnMessage, readCts.Token);
-
-            // пинги
-            _ = Task.Run(async () =>
-            {
-                while (!readCts.IsCancellationRequested)
-                {
-                    try { await ws.PingAsync(readCts.Token); } catch { }
-                    await Task.Delay(TimeSpan.FromSeconds(20), readCts.Token);
-                }
-            }, readCts.Token);
-
+            // если --once: отправим демо-сообщение и выйдем
             if (once)
             {
-                await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
-                readCts.Cancel(); await readTask; return 0;
+                var chatId = chatArg ?? Environment.GetEnvironmentVariable("CHAT_ID") ?? cfg.Proxy.ChatId ?? Guid.NewGuid().ToString("N");
+                var sample = new { chatId, message = $"hello @ {DateTimeOffset.UtcNow}" };
+                await ws.ProduceAsync(sample, ct: cts.Token);
+                Console.WriteLine($"✓ Отправлено (chatId={chatId})");
+                return 0;
             }
 
-            Console.WriteLine("Вводи JSON для отправки. Пустая строка — пропуск. Ctrl+C — выход.");
+            Console.WriteLine("Вводи JSON (например: {\"chatId\":\"<id>\",\"message\":\"текст\"}). Пустая строка — пропуск. Ctrl+C — выход.");
+            _ = Task.Run(async () =>
+            {
+                // приём acks/ошибок
+                await ws.ReceiveLoopAsync(async json =>
+                {
+                    Console.WriteLine($"← {JsonSerializer.Serialize(json, new JsonSerializerOptions { WriteIndented = true })}");
+                    await Task.CompletedTask;
+                }, cts.Token);
+            }, cts.Token);
+
             string? line;
             while (!cts.IsCancellationRequested && (line = Console.ReadLine()) is not null)
             {
@@ -78,13 +94,13 @@ public static class Program
                 try
                 {
                     using var doc = JsonDocument.Parse(line);
-                    await ws.ProduceAsync(doc.RootElement.Clone(), key: cfg.Proxy.ProduceKey, headers: cfg.Proxy.ProduceHeaders, ct: cts.Token);
+                    await ws.ProduceAsync(doc.RootElement.Clone(), ct: cts.Token);
                     Console.WriteLine("✓ Отправлено");
                 }
                 catch (Exception ex) { Console.WriteLine($"! Некорректный JSON: {ex.Message}"); }
             }
 
-            readCts.Cancel(); await readTask; return 0;
+            return 0;
         }
         catch (OperationCanceledException) { return 0; }
         catch (Exception ex) { Console.Error.WriteLine($"Fatal: {ex}"); return 1; }
@@ -92,11 +108,19 @@ public static class Program
 
     private static RootConfig LoadConfig()
     {
-        var json = File.Exists("appsettings.json") ? File.ReadAllText("appsettings.json") : "{}";
-        var cfg = JsonSerializer.Deserialize<RootConfig>(json, new JsonSerializerOptions(JsonSerializerDefaults.Web)) ?? new();
+        var json = "{}";
+        if (File.Exists("appsettings.json"))
+        {
+            json = File.ReadAllText("appsettings.json");
+        }
+        var opts = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            ReadCommentHandling = JsonCommentHandling.Skip,
+            AllowTrailingCommas = true
+        };
+        var cfg = JsonSerializer.Deserialize<RootConfig>(json, opts) ?? new();
 
-        // ENV overrides (минимально полезные)
-        
+        // ENV overrides
         cfg.Auth.Authority = Env("AUTH_AUTHORITY", cfg.Auth.Authority);
         cfg.Auth.TokenEndpointPath = Env("AUTH_TOKEN_PATH", cfg.Auth.TokenEndpointPath);
         cfg.Auth.AllowHttp = Bool("AUTH_ALLOW_HTTP", cfg.Auth.AllowHttp);
@@ -106,10 +130,13 @@ public static class Program
         cfg.Auth.ClientId = Env("AUTH_CLIENT_ID", Env("CLIENT_ID", cfg.Auth.ClientId));
         cfg.Auth.ClientSecret = Env("AUTH_CLIENT_SECRET", Env("CLIENT_SECRET", cfg.Auth.ClientSecret ?? ""));
         cfg.Auth.Scope = Env("AUTH_SCOPE", Env("SCOPE", cfg.Auth.Scope));
-        
+
         cfg.Proxy.WsUrl = Env("PROXY_WS_URL", cfg.Proxy.WsUrl);
         cfg.Proxy.SseUrl = Env("PROXY_SSE_URL", cfg.Proxy.SseUrl);
-        cfg.Proxy.Topics = Env("TOPICS", string.Join(",", cfg.Proxy.Topics)).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        cfg.Proxy.StreamChatUrl = Env("PROXY_SSE_CHAT_URL", cfg.Proxy.StreamChatUrl ?? cfg.Proxy.SseUrl);
+        cfg.Proxy.ChatId = Env("CHAT_ID", cfg.Proxy.ChatId ?? "");
+        cfg.Proxy.Topics = Env("TOPICS", string.Join(",", cfg.Proxy.Topics))
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         cfg.Proxy.ProduceTopic = Env("PRODUCE_TOPIC", cfg.Proxy.ProduceTopic);
         cfg.Proxy.ProduceKey = Env("PRODUCE_KEY", cfg.Proxy.ProduceKey ?? "");
         cfg.Proxy.ConnectTimeoutSeconds = Int("CONNECT_TIMEOUT", cfg.Proxy.ConnectTimeoutSeconds);
@@ -131,20 +158,5 @@ public static class Program
         static string Env(string k, string d) => Environment.GetEnvironmentVariable(k) ?? d;
         static bool Bool(string k, bool d) => bool.TryParse(Environment.GetEnvironmentVariable(k), out var v) ? v : d;
         static int Int(string k, int d) => int.TryParse(Environment.GetEnvironmentVariable(k), out var v) ? v : d;
-    }
-
-    private static Task OnMessage(JsonElement json)
-    {
-        if (json.TryGetProperty("type", out var t))
-        {
-            var type = t.GetString();
-            if (type is "message" or "ack")
-            {
-                Console.WriteLine($"← {type}: {JsonSerializer.Serialize(json, new JsonSerializerOptions { WriteIndented = true })}");
-                return Task.CompletedTask;
-            }
-        }
-        Console.WriteLine($"← {json}");
-        return Task.CompletedTask;
     }
 }

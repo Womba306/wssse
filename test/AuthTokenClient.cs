@@ -14,54 +14,49 @@ public sealed class AuthTokenClient
     {
         _cfg = cfg;
 
-        var handler = new HttpClientHandler
+        var handler = new HttpClientHandler();
+        if (_cfg.SkipTlsVerify)
         {
-            SslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-            // Для HTTP это игнорируется; для HTTPS можно включить строгую проверку
-            ServerCertificateCustomValidationCallback = _cfg.SkipTlsVerify
-                ? HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
-                : null
-        };
+            handler.ServerCertificateCustomValidationCallback =
+                HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+        }
 
-        _http = new HttpClient(handler)
+        _http = new HttpClient(handler, disposeHandler: true)
         {
-            Timeout = TimeSpan.FromSeconds(20),
-            BaseAddress = BuildAuthorityUri()
+            Timeout = TimeSpan.FromSeconds(30)
         };
-    }
-
-    private Uri BuildAuthorityUri()
-    {
         if (!_cfg.AllowHttp && _cfg.Authority.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("HTTPS required by config. Set Auth:AllowHttp=true to use HTTP.");
-
-        return new Uri(_cfg.Authority.EndsWith("/") ? _cfg.Authority : _cfg.Authority + "/");
+            throw new InvalidOperationException("HTTPS is required by configuration");
+        _http.BaseAddress = new Uri(_cfg.Authority.TrimEnd('/') + "/");
     }
 
-    public async Task<AccessToken> GetPasswordTokenAsync(CancellationToken ct)
+    public async Task<AccessToken> GetPasswordTokenAsync(CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(_cfg.Username) || string.IsNullOrWhiteSpace(_cfg.Password))
             throw new InvalidOperationException("Username/Password are required.");
 
+        if (string.IsNullOrWhiteSpace(_cfg.ClientId))
+            throw new InvalidOperationException("ClientId is required.");
+
         var form = new Dictionary<string, string>
         {
-            ["grant_type"] = "password",
-            ["username"] = "admin",
+            ["grant_type"] = string.IsNullOrWhiteSpace(_cfg.grant_type) ? "password" : _cfg.grant_type!,
+            ["username"] = _cfg.Username!,
             ["password"] = _cfg.Password!,
-            ["client_id"] = _cfg.ClientId
+            ["client_id"] = _cfg.ClientId!
         };
         if (!string.IsNullOrWhiteSpace(_cfg.ClientSecret))
             form["client_secret"] = _cfg.ClientSecret!;
         if (!string.IsNullOrWhiteSpace(_cfg.Scope))
-            form["scope"] = _cfg.Scope;
+            form["scope"] = _cfg.Scope!;
 
-        using var req = new HttpRequestMessage(HttpMethod.Post, _cfg.TokenEndpointPath)
+        using var req = new HttpRequestMessage(HttpMethod.Post, _cfg.TokenEndpointPath.TrimStart('/'))
         {
             Content = new FormUrlEncodedContent(form)
         };
 
-        using var resp = await _http.SendAsync(req, ct);
-        var body = await resp.Content.ReadAsStringAsync(ct);
+        using var resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         if (!resp.IsSuccessStatusCode)
             throw new InvalidOperationException($"Token request failed {resp.StatusCode}: {body}");
