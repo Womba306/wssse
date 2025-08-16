@@ -1,6 +1,12 @@
-﻿using System.Text.Json.Serialization;
+﻿using System.Text.Json;
 
 namespace FrogProg.KafkaProxyClient;
+
+public sealed class ProxyConfig
+{
+    public string WsUrl { get; set; } = "ws://91.206.15.217:8083/ws";
+    public string SseUrl { get; set; } = "http://91.206.15.217:8083/stream_chat";
+}
 
 public sealed class RootConfig
 {
@@ -8,36 +14,29 @@ public sealed class RootConfig
     public ProxyConfig Proxy { get; set; } = new();
 }
 
-public sealed class AuthConfig
+public static class ConfigLoader
 {
-    public string? grant_type { get; set; } = "password";
-    public string Authority { get; set; } = "http://91.206.15.217:8080/api/auth";
-    public string TokenEndpointPath { get; set; } = "/connect/token";
-    public bool AllowHttp { get; set; } = true;
-    public bool SkipTlsVerify { get; set; } = false;
-    public string? Username { get; set; }
-    public string? Password { get; set; }
-    public string ClientId { get; set; } = "api_gateway";
-    public string? ClientSecret { get; set; } = "secret-for-api-gateway";
-    public string Scope { get; set; } = "frog_api";
-}
+    public static RootConfig Load(string path)
+    {
+        var json = System.IO.File.Exists(path) ? System.IO.File.ReadAllText(path) : "{}";
+        var cfg = JsonSerializer.Deserialize<RootConfig>(json, new JsonSerializerOptions(JsonSerializerDefaults.Web)) ?? new();
 
-public sealed class ProxyConfig
-{
-    public string WsUrl { get; set; } = "ws://91.206.15.217:8083/ws";
-    public string SseUrl { get; set; } = "http://91.206.15.217:8083/stream";
-    public string? StreamChatUrl { get; set; } = "http://91.206.15.217:8083/stream_chat";
-    public string[] Topics { get; set; } = new[] { "ai-requests", "ai-responses" };
-    public string ProduceTopic { get; set; } = "ai-requests";
-    public string? ProduceKey { get; set; }
-    public Dictionary<string, string>? ProduceHeaders { get; set; } = new();
-    public int ConnectTimeoutSeconds { get; set; } = 20;
-    public int SendTimeoutSeconds { get; set; } = 15;
-    public int ReceiveBufferBytes { get; set; } = 1_048_576;
-    public string? ChatId { get; set; }
-}
+        // ENV overrides
+        cfg.Auth.Authority = Env("AUTH_AUTHORITY", cfg.Auth.Authority);
+        cfg.Auth.TokenEndpointPath = Env("AUTH_TOKEN_PATH", cfg.Auth.TokenEndpointPath);
+        cfg.Auth.AllowHttp = Bool("AUTH_ALLOW_HTTP", cfg.Auth.AllowHttp);
+        cfg.Auth.SkipTlsVerify = Bool("AUTH_SKIP_TLS", cfg.Auth.SkipTlsVerify);
+        cfg.Auth.Username = Env("AUTH_USERNAME", cfg.Auth.Username);
+        cfg.Auth.Password = Env("AUTH_PASSWORD", cfg.Auth.Password);
+        cfg.Auth.ClientId = Env("AUTH_CLIENT_ID", cfg.Auth.ClientId);
+        cfg.Auth.ClientSecret = Env("AUTH_CLIENT_SECRET", cfg.Auth.ClientSecret);
+        cfg.Auth.Scope = Env("AUTH_SCOPE", cfg.Auth.Scope);
 
-public sealed record AccessToken(string Token, DateTimeOffset ExpiresAt)
-{
-    [JsonIgnore] public bool IsExpired => DateTimeOffset.UtcNow >= ExpiresAt.AddSeconds(-30);
+        cfg.Proxy.WsUrl = Env("PROXY_WS_URL", cfg.Proxy.WsUrl);
+        cfg.Proxy.SseUrl = Env("PROXY_SSE_URL", cfg.Proxy.SseUrl);
+        return cfg;
+
+        static string Env(string k, string d) => Environment.GetEnvironmentVariable(k) ?? d;
+        static bool Bool(string k, bool d) => bool.TryParse(Environment.GetEnvironmentVariable(k), out var v) ? v : d;
+    }
 }
