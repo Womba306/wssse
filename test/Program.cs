@@ -139,7 +139,7 @@ public static class Program
         static JsonElement Wrap(string c, string m)
         {
             var json = $$"""
-            {"chatId":{{JsonSerializer.Serialize(c)}},"message":{{JsonSerializer.Serialize(m)}},"lesson_phase":0}
+            {"chatId":{{JsonSerializer.Serialize(c)}},"message":{{JsonSerializer.Serialize(m)}},"lesson_phase":1}
             """;
             using var wrapped = JsonDocument.Parse(json);
             return wrapped.RootElement.Clone();
